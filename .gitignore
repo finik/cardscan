@@ -1,0 +1,13 @@
+.DS_Store
+.pi/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.apk
+*.iml
+
+app/.dart_tool/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/.idea/
+app/build/
