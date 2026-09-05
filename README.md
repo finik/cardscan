@@ -141,6 +141,62 @@ Permissions: camera and internet (cleartext HTTP on the LAN). No broad storage p
 
 Deck names are sanitized on the server (letters, numbers, space, `-`, `_`; max 80). Path traversal is rejected.
 
+
+## 3. Static deck catalog
+
+Browse the archive as a self-contained static website (home grid + per-deck pages + lightbox). No database and no running inbox — only deck folders and optional `deck.json` metadata.
+
+### Generate
+
+```bash
+python3 server/generate_catalog.py /path/to/cards -o site
+```
+
+Open `site/index.html` through any static host. Demo build from the in-repo fixtures (tiny placeholder JPEGs):
+
+```bash
+python3 server/generate_catalog.py server/fixtures -o site
+python3 -m http.server -d site 8000
+```
+
+### `deck.json` (optional, per deck folder)
+
+```json
+{
+  "title": "Vikings",
+  "description": "Nordic-inspired court designs.",
+  "tags": ["custom", "linen"],
+  "cover": "box_01.jpg",
+  "notes": "Missing 8C; re-shoot later."
+}
+```
+
+| Field | Type | Default |
+|---|---|---|
+| `title` | string | folder name |
+| `description` | string | `""` |
+| `tags` | string[] | `[]` |
+| `cover` | filename under the deck | first box, else back, else first card |
+| `notes` | string | `""` |
+
+Invalid or missing `deck.json` is ignored; the folder name is used as the title. Schema is also printed by `python3 server/generate_catalog.py -h`.
+
+### GitHub Pages
+
+**Option A — Actions (recommended for the public demo):** this repo includes [`.github/workflows/catalog-pages.yml`](.github/workflows/catalog-pages.yml). It builds from `server/fixtures/` on pushes to `main` and deploys to GitHub Pages. Enable under **Settings → Pages → Source: GitHub Actions**. Your private photo archive does not need to be in git.
+
+**Option B — manual / private archive:** generate locally into `docs/` (or `site/`), commit if you want the branch to serve Pages from `/docs`, or rsync the output folder elsewhere:
+
+```bash
+python3 server/generate_catalog.py /path/to/cards -o docs
+```
+
+Then set Pages to deploy from the `docs/` folder on `main`, or host `site/` on any static CDN.
+
+```bash
+python3 -m unittest discover -s server -v
+```
+
 ## License
 
 Private / unspecified. Add a license file before making the repository public if you need one.
