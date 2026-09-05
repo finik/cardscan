@@ -1,0 +1,7 @@
+{
+  "title": "Sample Deck",
+  "description": "A tiny fixture deck for catalog demos and tests. Not a real scan archive.",
+  "tags": ["fixture", "demo"],
+  "cover": "box_01.jpg",
+  "notes": "Images are 1×1 placeholder JPEGs."
+}
