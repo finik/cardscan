@@ -11,3 +11,7 @@ app/.flutter-plugins
 app/.flutter-plugins-dependencies
 app/.idea/
 app/build/
+
+# generated gallery output + demo archive
+site/dist/
+site/sample/

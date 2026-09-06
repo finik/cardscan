@@ -130,6 +130,19 @@ If the Mac is unreachable, shots queue locally and retry.
 
 Permissions: camera and internet (cleartext HTTP on the LAN). No broad storage permission.
 
+## 3. Gallery (static site)
+
+Turn an archive into a browsable static site — deck list with typeahead
+search, a per-deck grid (suits as columns) with metadata, and a full-screen
+Cover Flow carousel. No server or database; plain HTML for S3 or GitHub Pages.
+
+```bash
+python3 site/build.py /path/to/cards -o site/dist
+python3 -m http.server -d site/dist 9000   # preview at http://localhost:9000
+```
+
+See `site/README.md` for the `deck.json` metadata schema and deploy notes.
+
 ## Filename rules
 
 | Mode | Path | Policy |
