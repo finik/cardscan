@@ -68,7 +68,7 @@ class _HolePainter extends CustomPainter {
     final cut = Path()..addRRect(RRect.fromRectXY(hole, 10, 10));
     canvas.drawPath(
       Path.combine(PathOperation.difference, overlay, cut),
-      Paint()..color = const Color(0x66000000),
+      Paint()..color = const Color(0xFF000000),
     );
     canvas.drawRRect(
       RRect.fromRectXY(hole, 10, 10),
