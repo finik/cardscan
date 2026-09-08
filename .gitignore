@@ -15,3 +15,7 @@ app/build/
 # generated gallery output + demo archive
 site/dist/
 site/sample/
+
+# debug stills used to replay real captures offline (large binaries)
+app/test/fixtures/
+app/test/out/

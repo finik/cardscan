@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -24,8 +27,8 @@ class SimpleCaptureScreen extends StatefulWidget {
 
 class _SimpleCaptureScreenState extends State<SimpleCaptureScreen> {
   bool _busy = false;
-  Uint8List? _lastThumb;
-  String? _lastPath;
+  bool _focusing = false;
+  bool _focusLocked = false;
   final _viewKey = GlobalKey();
   final _frameKey = GlobalKey();
 
@@ -60,77 +63,69 @@ class _SimpleCaptureScreenState extends State<SimpleCaptureScreen> {
     if (mounted) setState(() {});
   }
 
+  FrameGeometry? _geometry(CameraController cam) => readFrameGeometry(
+        viewKey: _viewKey,
+        frameKey: _frameKey,
+        controller: cam,
+        portrait: widget.category != CaptureCategory.box,
+      );
+
+  /// Focus once when the preview is laid out, so the shutter path is only
+  /// takePicture().
+  void _primeOnce(CameraController cam) {
+    if (_focusLocked || _focusing) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) => _refocus(cam));
+  }
+
+  Future<void> _refocus(CameraController cam) async {
+    if (_focusing) return;
+    final geometry = _geometry(cam);
+    if (geometry == null) return;
+    setState(() => _focusing = true);
+    await primeFocus(cam, geometry);
+    if (!mounted) return;
+    setState(() {
+      _focusing = false;
+      _focusLocked = true;
+    });
+  }
+
   Future<void> _shutter(CameraController cam) async {
     if (_busy || cam.value.isTakingPicture) return;
+
+    // Only back.jpg has a fixed name that can collide; box and extras are
+    // numbered by the server. Ask before the shutter so nothing has to
+    // interrupt the operator once the shot is on its way.
+    var replace = false;
+    String? filename;
+    if (widget.category == CaptureCategory.back &&
+        widget.state.listing.back.contains('back.jpg')) {
+      final choice = await _backConflict();
+      if (choice == null || !mounted) return;
+      replace = choice == 'replace';
+      if (choice == 'keep') filename = 'back_2.jpg';
+    }
+
     HapticFeedback.selectionClick();
     setState(() => _busy = true);
     try {
-      final result = await captureToFrame(
-        controller: cam,
-        viewKey: _viewKey,
-        frameKey: _frameKey,
-        portrait: widget.category != CaptureCategory.box,
-      );
-      await _send(result.jpeg);
+      final geometry = _geometry(cam);
+      final shot = await captureStill(controller: cam);
+      HapticFeedback.mediumImpact();
+      unawaited(widget.state.pipeline.submit(
+        srcPath: shot.path,
+        geometry: geometry,
+        deck: widget.state.deck,
+        category: widget.category,
+        filename: filename,
+        replace: replace,
+      ));
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
       }
     } finally {
       if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<void> _send(Uint8List jpeg, {bool replace = false, String? filename}) async {
-    try {
-      if (widget.category == CaptureCategory.back &&
-          widget.state.listing.back.contains('back.jpg') &&
-          !replace &&
-          filename == null) {
-        final choice = await _backConflict();
-        if (choice == null) return;
-        replace = choice == 'replace';
-        if (choice == 'keep') filename = 'back_2.jpg';
-      }
-      final ok = await widget.state.uploadNow(
-        category: widget.category,
-        jpeg: jpeg,
-        filename: filename,
-        replace: replace,
-      );
-      HapticFeedback.mediumImpact();
-      if (!mounted) return;
-      setState(() {
-        _lastThumb = jpeg;
-        _lastPath = ok.path;
-      });
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(ok.path)));
-    } on UploadExists catch (e) {
-      if (!mounted) return;
-      final choice = await _existsDialog(e);
-      if (choice == 'replace') {
-        await _send(jpeg, replace: true, filename: filename ?? basenameOfPath(e.path));
-      } else if (choice == 'keep' && e.suggested != null) {
-        await _send(jpeg, filename: basenameOfPath(e.suggested!));
-      }
-    } on UploadFailure catch (e) {
-      if (e.network) {
-        widget.state.markUnreachable();
-        await widget.state.enqueueFailed(
-          category: widget.category,
-          jpeg: jpeg,
-          filename: filename,
-          replace: replace,
-        );
-        if (mounted) {
-          setState(() => _lastThumb = jpeg);
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Queued — Mac unreachable')),
-          );
-        }
-      } else if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
-      }
     }
   }
 
@@ -149,19 +144,12 @@ class _SimpleCaptureScreenState extends State<SimpleCaptureScreen> {
     );
   }
 
-  Future<String?> _existsDialog(UploadExists e) {
-    return showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('File exists'),
-        content: Text('${e.path} already exists.'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-          TextButton(onPressed: () => Navigator.pop(ctx, 'keep'), child: const Text('Keep both')),
-          FilledButton(onPressed: () => Navigator.pop(ctx, 'replace'), child: const Text('Replace')),
-        ],
-      ),
-    );
+  String get _statusLine {
+    if (_focusing) return 'Focusing…';
+    final n = widget.state.inFlight;
+    if (n > 0) return '$n processing…';
+    if (!widget.state.reachable) return 'Mac unreachable — shots are queued';
+    return 'Line it up in the frame';
   }
 
   @override
@@ -170,6 +158,7 @@ class _SimpleCaptureScreenState extends State<SimpleCaptureScreen> {
       backgroundColor: Colors.black,
       body: StillCamera(
         builder: (context, cam) {
+          _primeOnce(cam);
           return LayoutBuilder(builder: (context, constraints) {
             final inset = MediaQuery.paddingOf(context);
             final hole = cardFrameIn(
@@ -204,6 +193,14 @@ class _SimpleCaptureScreenState extends State<SimpleCaptureScreen> {
                           style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w600),
                         ),
                       ),
+                      IconButton(
+                        onPressed: _focusing ? null : () => _refocus(cam),
+                        tooltip: 'Refocus on the guide',
+                        icon: Icon(
+                          _focusing ? Icons.hourglass_top : Icons.center_focus_strong,
+                          color: _focusing ? Colors.white38 : Colors.white,
+                        ),
+                      ),
                     ],
                   ),
                 ),
@@ -215,17 +212,11 @@ class _SimpleCaptureScreenState extends State<SimpleCaptureScreen> {
                     padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
                     child: Row(
                       children: [
-                        if (_lastThumb != null)
-                          ClipRRect(
-                            borderRadius: BorderRadius.circular(6),
-                            child: Image.memory(_lastThumb!, width: 48, height: 68, fit: BoxFit.cover),
-                          )
-                        else
-                          const SizedBox(width: 48, height: 68),
+                        _LastShotThumb(path: widget.state.pipeline.lastWarpedPath),
                         const SizedBox(width: 12),
                         Expanded(
                           child: Text(
-                            _lastPath ?? 'Line it up in the frame',
+                            _statusLine,
                             style: const TextStyle(color: Colors.white),
                           ),
                         ),
@@ -250,6 +241,30 @@ class _SimpleCaptureScreenState extends State<SimpleCaptureScreen> {
             );
           });
         },
+      ),
+    );
+  }
+}
+
+class _LastShotThumb extends StatelessWidget {
+  const _LastShotThumb({required this.path});
+  final String? path;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = path;
+    if (p == null || !File(p).existsSync()) {
+      return const SizedBox(width: 48, height: 68);
+    }
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(6),
+      child: Image.file(
+        File(p),
+        key: ValueKey(p),
+        width: 48,
+        height: 68,
+        fit: BoxFit.cover,
+        gaplessPlayback: true,
       ),
     );
   }

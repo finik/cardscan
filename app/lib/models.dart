@@ -92,6 +92,7 @@ class PendingJob {
     required this.category,
     this.filename,
     this.replace = false,
+    this.attempts = 0,
   });
 
   final String id;
@@ -101,6 +102,10 @@ class PendingJob {
   final String? filename;
   final bool replace;
 
+  /// Server-side rejections so far. The file is only set aside, never
+  /// deleted, once this passes the queue's limit.
+  int attempts;
+
   Map<String, dynamic> toJson() => {
         'id': id,
         'filePath': filePath,
@@ -108,6 +113,7 @@ class PendingJob {
         'category': category,
         'filename': filename,
         'replace': replace,
+        'attempts': attempts,
       };
 
   factory PendingJob.fromJson(Map<String, dynamic> json) => PendingJob(
@@ -117,6 +123,7 @@ class PendingJob {
         category: json['category'] as String,
         filename: json['filename'] as String?,
         replace: json['replace'] as bool? ?? false,
+        attempts: json['attempts'] as int? ?? 0,
       );
 }
 

@@ -25,28 +25,37 @@ class _StillCameraState extends State<StillCamera> {
   Future<void> _open() async {
     try {
       final cameras = await availableCameras();
+      // ignore: avoid_print
+      print('cscan cameras: ${cameras.map((c) => '${c.name}/${c.lensDirection.name}').join(', ')}');
       final back = cameras.firstWhere(
         (c) => c.lensDirection == CameraLensDirection.back,
         orElse: () => cameras.first,
       );
       final controller = CameraController(
         back,
-        ResolutionPreset.veryHigh,
+        // The card occupies roughly two thirds of the frame, so a 1080p still
+        // gave a ~680x950 card region that then had to be scaled *up* to the
+        // 1000x1400 output — the sharpness ceiling. ultraHigh (~2160p) makes
+        // that region large enough to downsample into the output instead.
+        // _viewRectToQuad now handles a still whose aspect differs from the
+        // preview's, so this no longer has to match 16:9 by luck.
+        ResolutionPreset.ultraHigh,
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.jpeg,
       );
       await controller.initialize();
+      // ignore: avoid_print
+      final preview = controller.value.previewSize;
+      print('cscan using ${back.name} '
+          'preview=${preview?.width.round()}x${preview?.height.round()}');
       try {
         await controller.lockCaptureOrientation(DeviceOrientation.portraitUp);
       } catch (_) {}
       try {
         await controller.setFlashMode(FlashMode.off);
       } catch (_) {}
-      try {
-        await controller.setFocusMode(FocusMode.auto);
-        await controller.setFocusPoint(const Offset(0.5, 0.5));
-        await controller.setExposurePoint(const Offset(0.5, 0.5));
-      } catch (_) {}
+      // Focus is left alone here: the capture screens call primeFocus() once
+      // they know where the guide is, and lock it there.
       if (!mounted) {
         await controller.dispose();
         return;

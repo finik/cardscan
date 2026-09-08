@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
@@ -8,7 +7,6 @@ import 'package:flutter/services.dart';
 import '../app_state.dart';
 import '../capture.dart';
 import '../models.dart';
-import '../warp.dart';
 import '../widgets/camera_cover.dart';
 import '../widgets/still_camera.dart';
 
@@ -25,6 +23,8 @@ class _CardPadScreenState extends State<CardPadScreen> {
   String _rank = 'A';
   bool _shooting = false;
   bool _flash = false;
+  bool _focusing = false;
+  bool _focusLocked = false;
   final _viewKey = GlobalKey();
   final _frameKey = GlobalKey();
 
@@ -47,26 +47,82 @@ class _CardPadScreenState extends State<CardPadScreen> {
 
   Set<String> get _done => widget.state.listing.completedCardCodes;
 
+  /// Focus once when the preview is laid out; after that the shutter path
+  /// never touches focus.
+  void _primeOnce(CameraController cam) {
+    if (_focusLocked || _focusing) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) => _refocus(cam));
+  }
+
+  Future<void> _refocus(CameraController cam) async {
+    if (_focusing) return;
+    final geometry =
+        readFrameGeometry(viewKey: _viewKey, frameKey: _frameKey, controller: cam);
+    if (geometry == null) return;
+    setState(() => _focusing = true);
+    await primeFocus(cam, geometry);
+    if (!mounted) return;
+    setState(() {
+      _focusing = false;
+      _focusLocked = true;
+    });
+  }
+
   Future<void> _capture(CameraController cam, String rank) async {
     if (_shooting || cam.value.isTakingPicture) return;
-    setState(() => _rank = rank);
+    if (!_focusLocked) {
+      // Priming takes seconds on this device; shooting through it produces
+      // unfocused cards, so make the wait visible instead of silent.
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Focusing…'), duration: Duration(milliseconds: 700)),
+      );
+      return;
+    }
     final code = '$rank$_suit';
-    HapticFeedback.selectionClick();
+
+    // Ask before the shutter, not after the upload: by the time the upload
+    // lands the operator is already shooting the next card, and a dialog then
+    // would be both surprising and in the way. A conflict the listing did not
+    // know about is kept as a second file rather than replacing anything.
+    var replace = false;
+    if (_done.contains(code)) {
+      final choice = await _existsDialog(code);
+      if (choice == null || !mounted) return;
+      if (choice == 'delete') {
+        await _delete(code);
+        return;
+      }
+      replace = choice == 'replace';
+    }
+
     setState(() {
+      _rank = rank;
       _shooting = true;
       _flash = true;
     });
-    await Future<void>.delayed(const Duration(milliseconds: 50));
-    if (mounted) setState(() => _flash = false);
+    HapticFeedback.selectionClick();
+    Timer(const Duration(milliseconds: 60), () {
+      if (mounted) setState(() => _flash = false);
+    });
+
     try {
-      final result = await captureToFrame(
-        controller: cam,
-        viewKey: _viewKey,
-        frameKey: _frameKey,
-      );
-      if (!mounted) return;
-      unawaited(_send(code, result.jpeg));
-      unawaited(_sendDebug(code, result));
+      final geometry =
+          readFrameGeometry(viewKey: _viewKey, frameKey: _frameKey, controller: cam);
+      final shot = await captureStill(controller: cam);
+      HapticFeedback.mediumImpact();
+      widget.state.markCardCapturedLocally(code);
+      // Hand the still off and go: warping and uploading run in the
+      // background, so the next rank can be shot right now.
+      unawaited(widget.state.pipeline.submit(
+        srcPath: shot.path,
+        geometry: geometry,
+        deck: widget.state.deck,
+        category: CaptureCategory.card,
+        filename: '$code.jpg',
+        replace: replace,
+        debug: widget.state.debugUploads,
+        debugName: code,
+      ));
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
@@ -76,82 +132,50 @@ class _CardPadScreenState extends State<CardPadScreen> {
     }
   }
 
-  Future<void> _send(String code, Uint8List jpeg, {bool replace = false, String? filename}) async {
-    filename ??= '$code.jpg';
-    try {
-      final ok = await widget.state.uploadNow(
-        category: CaptureCategory.card,
-        jpeg: jpeg,
-        filename: filename,
-        replace: replace,
-      );
-      HapticFeedback.mediumImpact();
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(ok.path), duration: const Duration(milliseconds: 900)),
-      );
-    } on UploadExists catch (e) {
-      if (!mounted) return;
-      final choice = await showDialog<String>(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          title: const Text('Already on Mac'),
-          content: Text('${e.path} exists. Replace it, or keep both?'),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-            TextButton(onPressed: () => Navigator.pop(ctx, 'keep'), child: const Text('Keep both')),
-            FilledButton(onPressed: () => Navigator.pop(ctx, 'replace'), child: const Text('Replace')),
-          ],
-        ),
-      );
-      if (choice == 'replace') {
-        await _send(code, jpeg, replace: true, filename: '$code.jpg');
-      } else if (choice == 'keep') {
-        final name = e.suggested != null ? basenameOfPath(e.suggested!) : '${code}_2.jpg';
-        await _send(code, jpeg, filename: name);
-      }
-    } on UploadFailure catch (e) {
-      if (e.network) {
-        widget.state.markUnreachable();
-        await widget.state.enqueueFailed(
-          category: CaptureCategory.card,
-          jpeg: jpeg,
-          filename: filename,
-          replace: replace,
-        );
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Queued — Mac unreachable')),
-          );
-        }
-      } else if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
-      }
-    }
+  Future<String?> _existsDialog(String code) {
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('$code already shot'),
+        content: Text('Replace $code.jpg on the Mac, keep both, or delete it?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'delete'),
+            child: const Text('Delete'),
+          ),
+          TextButton(onPressed: () => Navigator.pop(ctx, 'keep'), child: const Text('Keep both')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, 'replace'), child: const Text('Replace')),
+        ],
+      ),
+    );
   }
 
-  Future<void> _sendDebug(String code, WarpResult result) async {
-    final raw = result.raw;
-    if (raw == null) return;
+  /// Long-press a shot rank to throw it away and start over. The file is moved
+  /// to the deck's `_trash` on the Mac, not unlinked.
+  Future<void> _delete(String code) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Delete $code?'),
+        content: const Text('Moves it to _trash on the Mac so you can shoot it again.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Delete')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
     try {
-      await widget.state.api.upload(
-        deck: widget.state.deck,
-        category: CaptureCategory.debug,
-        jpeg: raw,
-        filename: '$code.src.jpg',
-        replace: true,
+      await widget.state.deleteCard(code);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('$code deleted'), duration: const Duration(milliseconds: 900)),
       );
-      final json = result.overlayJson;
-      if (json != null) {
-        await widget.state.api.upload(
-          deck: widget.state.deck,
-          category: CaptureCategory.debug,
-          jpeg: utf8.encode(json),
-          filename: '$code.json',
-          replace: true,
-        );
-      }
-    } catch (_) {}
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    }
   }
 
   @override
@@ -161,6 +185,7 @@ class _CardPadScreenState extends State<CardPadScreen> {
       backgroundColor: Colors.black,
       body: StillCamera(
         builder: (context, cam) {
+          _primeOnce(cam);
           return LayoutBuilder(builder: (context, constraints) {
             final inset = MediaQuery.paddingOf(context);
             const shutterH = 96.0;
@@ -206,7 +231,9 @@ class _CardPadScreenState extends State<CardPadScreen> {
                             suit: _suit,
                             rank: _rank,
                             done: _done,
+                            enabled: _focusLocked,
                             onSelect: (r) => _capture(cam, r),
+                            onDelete: (r) => _delete('$r$_suit'),
                           ),
                         ),
                       ),
@@ -219,8 +246,11 @@ class _CardPadScreenState extends State<CardPadScreen> {
                   top: inset.top,
                   child: _TopBar(
                     title: '${widget.state.deck}  $n/52',
+                    inFlight: widget.state.inFlight,
                     reachable: widget.state.reachable,
+                    focusing: _focusing,
                     onBack: () => Navigator.pop(context),
+                    onRefocus: () => _refocus(cam),
                   ),
                 ),
                 Positioned(
@@ -232,7 +262,7 @@ class _CardPadScreenState extends State<CardPadScreen> {
                       width: 88,
                       height: 88,
                       child: FilledButton(
-                        onPressed: null,
+                        onPressed: _focusing ? null : () => _refocus(cam),
                         style: FilledButton.styleFrom(
                           shape: const CircleBorder(),
                           backgroundColor: Colors.white,
@@ -240,7 +270,10 @@ class _CardPadScreenState extends State<CardPadScreen> {
                           disabledBackgroundColor: Colors.white24,
                           disabledForegroundColor: Colors.black38,
                         ),
-                        child: const Icon(Icons.camera_alt, size: 36),
+                        child: Icon(
+                          _focusLocked ? Icons.center_focus_strong : Icons.camera_alt,
+                          size: 36,
+                        ),
                       ),
                     ),
                   ),
@@ -257,12 +290,18 @@ class _CardPadScreenState extends State<CardPadScreen> {
 class _TopBar extends StatelessWidget {
   const _TopBar({
     required this.title,
+    required this.inFlight,
     required this.reachable,
+    required this.focusing,
     required this.onBack,
+    required this.onRefocus,
   });
   final String title;
+  final int inFlight;
   final bool reachable;
+  final bool focusing;
   final VoidCallback onBack;
+  final VoidCallback onRefocus;
 
   @override
   Widget build(BuildContext context) {
@@ -281,6 +320,27 @@ class _TopBar extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
             ),
           ),
+          IconButton(
+            onPressed: focusing ? null : onRefocus,
+            tooltip: 'Refocus on the guide',
+            icon: Icon(
+              focusing ? Icons.hourglass_top : Icons.center_focus_strong,
+              color: focusing ? Colors.white38 : Colors.white,
+            ),
+          ),
+          if (inFlight > 0) ...[
+            const SizedBox(
+              width: 14,
+              height: 14,
+              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white70),
+            ),
+            const SizedBox(width: 6),
+            Text(
+              '$inFlight',
+              style: const TextStyle(color: Colors.white70, fontSize: 14),
+            ),
+            const SizedBox(width: 10),
+          ],
         ],
       ),
     );
@@ -336,12 +396,16 @@ class _RankPad extends StatelessWidget {
     required this.suit,
     required this.rank,
     required this.done,
+    required this.enabled,
     required this.onSelect,
+    required this.onDelete,
   });
   final String suit;
   final String rank;
   final Set<String> done;
+  final bool enabled;
   final ValueChanged<String> onSelect;
+  final ValueChanged<String> onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -366,11 +430,13 @@ class _RankPad extends StatelessWidget {
                 child: Padding(
                   padding: const EdgeInsets.all(3),
                   child: Material(
-                    color: selected
-                        ? Colors.white.withValues(alpha: 0.85)
-                        : isDone
-                            ? const Color(0x992E7D32)
-                            : const Color(0x55000000),
+                    color: !enabled
+                        ? const Color(0x33000000)
+                        : selected
+                            ? Colors.white.withValues(alpha: 0.85)
+                            : isDone
+                                ? const Color(0x992E7D32)
+                                : const Color(0x55000000),
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(8),
                       side: BorderSide(
@@ -380,6 +446,7 @@ class _RankPad extends StatelessWidget {
                     ),
                     child: InkWell(
                       onTap: () => onSelect(r),
+                      onLongPress: isDone ? () => onDelete(r) : null,
                       borderRadius: BorderRadius.circular(8),
                       child: Center(
                         child: Row(

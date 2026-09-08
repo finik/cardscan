@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import threading
 import unittest
 from http.client import HTTPConnection
@@ -133,6 +134,62 @@ class HttpTests(unittest.TestCase):
             body=body,
             headers={"Content-Type": ctype, "Content-Length": str(len(body))},
         )
+
+    def test_deck_dir_inherits_root_mode(self):
+        # A group/world-writable share must not sprout 0755 deck folders:
+        # deleting a file needs write on its directory, not on the file.
+        os.chmod(self.root, 0o777)
+        self._upload({"deck": "Vikings", "category": "card", "filename": "5H.jpg"})
+        mode = (self.root / "Vikings").stat().st_mode & 0o777
+        self.assertEqual(mode, 0o777, f"deck dir is {mode:o}")
+
+    def test_uploads_are_group_and_other_readable(self):
+        self._upload({"deck": "Vikings", "category": "card", "filename": "5H.jpg"})
+        mode = (self.root / "Vikings" / "5H.jpg").stat().st_mode & 0o777
+        # mkstemp's 0600 would make the archive unreadable over a NAS share.
+        self.assertTrue(mode & 0o044, f"mode {mode:o} is not readable by others")
+
+    def _delete(self, deck: str, filename: str):
+        body = json.dumps({"deck": deck, "filename": filename}).encode()
+        return self._json(
+            "POST",
+            "/delete",
+            body=body,
+            headers={"Content-Type": "application/json", "Content-Length": str(len(body))},
+        )
+
+    def test_delete_moves_card_to_trash(self):
+        self._upload({"deck": "Vikings", "category": "card", "filename": "2S.jpg"})
+        status, payload = self._delete("Vikings", "2S.jpg")
+        self.assertEqual(status, 200, payload)
+        self.assertFalse((self.root / "Vikings" / "2S.jpg").exists())
+        trashed = list((self.root / "Vikings" / "_trash").iterdir())
+        self.assertEqual(len(trashed), 1)
+        self.assertTrue(trashed[0].name.endswith("2S.jpg"))
+        self.assertEqual(trashed[0].read_bytes(), TINY_JPEG)
+
+        _, listing = self._json("GET", "/deck/Vikings")
+        self.assertEqual(listing["cards"], [])
+
+        # Re-shooting the deleted card is a plain upload again, no 409.
+        status, payload = self._upload(
+            {"deck": "Vikings", "category": "card", "filename": "2S.jpg"}
+        )
+        self.assertEqual(status, 200, payload)
+
+    def test_delete_extra(self):
+        self._upload({"deck": "Vikings", "category": "extra"})
+        status, payload = self._delete("Vikings", "01.jpg")
+        self.assertEqual(status, 200, payload)
+        self.assertFalse((self.root / "Vikings" / "extras" / "01.jpg").exists())
+
+    def test_delete_missing_and_traversal(self):
+        status, _ = self._delete("Vikings", "AS.jpg")
+        self.assertEqual(status, 404)
+        status, _ = self._delete("Vikings", "../../etc/passwd")
+        self.assertEqual(status, 400)
+        status, _ = self._delete("", "AS.jpg")
+        self.assertEqual(status, 400)
 
     def test_health(self):
         status, payload = self._json("GET", "/health")

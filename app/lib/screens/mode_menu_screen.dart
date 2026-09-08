@@ -45,7 +45,7 @@ class _ModeMenuScreenState extends State<ModeMenuScreen> {
           const SizedBox(height: 12),
           Text(
             '${listing.fileCount} files on Mac'
-            '${s.pendingCount > 0 ? '  ·  ${s.pendingCount} pending' : ''}',
+            '${s.inFlight > 0 ? '  ·  ${s.inFlight} still processing' : ''}',
             style: Theme.of(context).textTheme.bodyMedium,
           ),
           const SizedBox(height: 16),
@@ -78,6 +78,12 @@ class _ModeMenuScreenState extends State<ModeMenuScreen> {
             title: 'Capture extras',
             subtitle: '${listing.extras.length} saved (jokers, extras)',
             onTap: () => _openSimple(CaptureCategory.extra),
+          ),
+          SwitchListTile(
+            value: s.debugUploads,
+            onChanged: s.setDebugUploads,
+            title: const Text('Upload originals'),
+            subtitle: const Text('Keeps the full still and guide box under _debug so a bad crop can be diagnosed afterwards.'),
           ),
         ],
       ),

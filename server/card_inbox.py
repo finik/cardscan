@@ -4,18 +4,22 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
 import socket
+import stat
 import sys
 import tempfile
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import TCPServer
 from pathlib import Path
 from urllib.parse import unquote
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+MAX_JSON_BYTES = 8 * 1024
 CARD_RE = re.compile(
     r"^(A|[2-9]|10|J|Q|K)[SHDC](_[0-9]+)?$",
     re.IGNORECASE,
@@ -82,6 +86,37 @@ def normalize_back_stem(filename: str | None) -> str | None:
     m = re.match(r"^back(_[0-9]+)?$", stem, re.IGNORECASE)
     suffix = m.group(1) or ""
     return f"back{suffix}.jpg"
+
+
+def mkdir_inherit(path: Path) -> None:
+    """Create *path* and any missing parents, copying the mode of the nearest
+    existing ancestor onto each new directory.
+
+    Python's default 0777 & ~umask gives 0755, which on a shared archive (a NAS
+    export, a second account) means nobody else can delete a file inside it —
+    removal is governed by the directory's write bit, not the file's. Matching
+    the share's own convention keeps the archive manageable from both ends.
+    """
+    if path.is_dir():
+        return
+    missing: list[Path] = []
+    probe = path
+    while not probe.exists():
+        missing.append(probe)
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+    try:
+        mode = stat.S_IMODE(probe.stat().st_mode)
+    except OSError:
+        mode = None
+    for directory in reversed(missing):
+        directory.mkdir(exist_ok=True)
+        if mode is not None:
+            try:
+                os.chmod(directory, mode)
+            except OSError:
+                pass
 
 
 def assert_under_root(root: Path, path: Path) -> Path:
@@ -286,6 +321,9 @@ class InboxHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
+        if path == "/delete":
+            self._handle_delete()
+            return
         if path != "/upload":
             self._send_json(404, {"ok": False, "error": "not found"})
             return
@@ -317,6 +355,59 @@ class InboxHandler(BaseHTTPRequestHandler):
             self._send_json(409, payload)
         except OSError as exc:
             self._send_json(500, {"ok": False, "error": f"write failed: {exc}"})
+
+    def _handle_delete(self) -> None:
+        """Move a file out of the archive so a bad scan can be re-shot.
+
+        Files go to <deck>/_trash/ rather than being unlinked: a scan is the
+        one thing here that cannot be reproduced by re-running anything.
+        """
+        try:
+            body = self._read_body(MAX_JSON_BYTES)
+            payload = json.loads(body.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("expected a JSON object")
+        except (ValueError, UnicodeDecodeError) as exc:
+            self._send_json(400, {"ok": False, "error": f"bad request: {exc}"})
+            return
+
+        deck = sanitize_deck(str(payload.get("deck", "")))
+        name = str(payload.get("filename", "")).strip()
+        if not deck:
+            self._send_json(400, {"ok": False, "error": "invalid deck name"})
+            return
+        if not name or name in {".", ".."} or "/" in name or "\\" in name:
+            self._send_json(400, {"ok": False, "error": "invalid filename"})
+            return
+
+        deck_dir = self.root / deck
+        src = deck_dir / name
+        if not src.exists():
+            src = deck_dir / "extras" / name
+        try:
+            src = assert_under_root(self.root, src)
+        except ValueError:
+            self._send_json(400, {"ok": False, "error": "invalid path"})
+            return
+        if not src.is_file():
+            self._send_json(404, {"ok": False, "error": "not found"})
+            return
+
+        trash = deck_dir / "_trash"
+        mkdir_inherit(trash)
+        dest = trash / f"{int(time.time())}-{src.name}"
+        n = 2
+        while dest.exists():
+            dest = trash / f"{int(time.time())}-{n}-{src.name}"
+            n += 1
+        try:
+            os.replace(src, dest)
+        except OSError as exc:
+            self._send_json(500, {"ok": False, "error": f"delete failed: {exc}"})
+            return
+        rel = dest.relative_to(self.root.resolve()).as_posix()
+        print(f"200 trashed {deck}/{src.name} -> {rel}", flush=True)
+        self._send_json(200, {"ok": True, "trashed": rel})
 
     def _field_text(self, fields: dict, name: str, required: bool = False) -> str | None:
         if name not in fields:
@@ -353,13 +444,13 @@ class InboxHandler(BaseHTTPRequestHandler):
             dest = deck_dir / name
             suggested = next_card_keep_both(name, deck_dir)
         elif category == "box":
-            deck_dir.mkdir(parents=True, exist_ok=True)
+            mkdir_inherit(deck_dir)
             name = next_box_name(deck_dir)
             dest = deck_dir / name
             suggested = None
         elif category == "extra":
             extras_dir = deck_dir / "extras"
-            extras_dir.mkdir(parents=True, exist_ok=True)
+            mkdir_inherit(extras_dir)
             name = next_extra_name(extras_dir)
             dest = extras_dir / name
             suggested = None
@@ -380,7 +471,7 @@ class InboxHandler(BaseHTTPRequestHandler):
             suggested = next_back_keep_both(deck_dir)
 
         dest_parent = dest.parent
-        dest_parent.mkdir(parents=True, exist_ok=True)
+        mkdir_inherit(dest_parent)
         dest = assert_under_root(self.root, dest)
 
         if dest.exists() and not replace:
@@ -395,21 +486,63 @@ class InboxHandler(BaseHTTPRequestHandler):
         print(f"201 {rel} {len(data)} bytes", flush=True)
         self._send_json(200, {"ok": True, "path": rel, "bytes": len(data)})
 
+    @staticmethod
+    def _replace_busy_tolerant(tmp_name: str, dest: Path) -> None:
+        _replace_busy_tolerant_impl(tmp_name, dest)
+
     def _atomic_write(self, dest: Path, data: bytes) -> None:
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        mkdir_inherit(dest.parent)
         fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", suffix=".jpg", dir=str(dest.parent))
         try:
             with os.fdopen(fd, "wb") as tmp:
                 tmp.write(data)
                 tmp.flush()
                 os.fsync(tmp.fileno())
-            os.replace(tmp_name, dest)
+            # mkstemp creates 0600, and os.replace keeps that mode. On a shared
+            # archive (a NAS share, another account, the site generator) 0600
+            # files are unreadable and undeletable by anyone but this uid, so
+            # apply the normal file mode instead.
+            os.chmod(tmp_name, 0o666 & ~_umask())
+            self._replace_busy_tolerant(tmp_name, dest)
         except Exception:
             try:
                 os.unlink(tmp_name)
             except OSError:
                 pass
             raise
+
+
+def _umask() -> int:
+    current = os.umask(0)
+    os.umask(current)
+    return current
+
+
+def _replace_busy_tolerant_impl(tmp_name: str, dest: Path) -> None:
+    """os.replace(tmp, dest), working around a busy destination.
+
+    An AFP server pins files it has recently written: both unlink(dest) and
+    rename(tmp, dest) fail with EBUSY, while renaming *dest itself* aside
+    succeeds. Without this, re-shooting a card that is already in the archive
+    returns 500 and the shot is lost.
+    """
+    try:
+        os.replace(tmp_name, dest)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EBUSY or not dest.exists():
+            raise
+    stale = dest.parent / f".stale-{int(time.time())}-{dest.name}"
+    os.replace(dest, stale)
+    try:
+        os.replace(tmp_name, dest)
+    except OSError:
+        os.replace(stale, dest)  # put it back rather than lose both
+        raise
+    try:
+        os.unlink(stale)
+    except OSError:
+        pass  # still pinned; it is hidden and swept on a later write
 
 
 def make_server(root: Path, port: int) -> ThreadingHTTPServer:
@@ -440,7 +573,7 @@ def prepare_root(path: Path, create: bool = True) -> Path:
     if not path.exists():
         if not create:
             raise SystemExit(f"missing directory: {path}")
-        path.mkdir(parents=True, exist_ok=True)
+        mkdir_inherit(path)
     return path.resolve()
 
 

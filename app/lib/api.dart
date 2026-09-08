@@ -68,6 +68,35 @@ class CardApi {
     }
   }
 
+  /// Move a file to the deck's `_trash` so the card can be re-shot.
+  Future<void> deleteFile({required String deck, required String filename}) async {
+    final client = _client();
+    try {
+      final resp = await client
+          .post(
+            Uri.parse('$baseUrl/delete'),
+            headers: {'User-Agent': _ua, 'Content-Type': 'application/json'},
+            body: jsonEncode({'deck': deck, 'filename': filename}),
+          )
+          .timeout(const Duration(seconds: 10));
+      if (resp.statusCode == 200) return;
+      String message;
+      try {
+        message = (jsonDecode(resp.body) as Map<String, dynamic>)['error'] as String? ??
+            'delete ${resp.statusCode}';
+      } catch (_) {
+        message = 'delete ${resp.statusCode}';
+      }
+      throw UploadFailure(message);
+    } on UploadFailure {
+      rethrow;
+    } catch (e) {
+      throw UploadFailure('network: $e', network: true);
+    } finally {
+      client.close();
+    }
+  }
+
   Future<UploadOk> upload({
     required String deck,
     required CaptureCategory category,

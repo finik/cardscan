@@ -124,7 +124,7 @@ Four modes: **box**, **back**, **cards**, **extras**.
 
 **Cards:** suit toggles (`S H D C`) and ranks `2 3 4 5` / `6 7 8 9` / `10` / `J Q K A` sit on the camera as an overlay inside the white guide. Tapping a rank takes the picture. Completed slots (from `GET /deck`) show a check. The round shutter under the guide is reserved for future auto-detect and is disabled.
 
-Line the card up inside the white rectangle (it does not have to be perfectly square). The app finds the card in that guide, warps it to 1000×1400, and uploads. White cards on a darker surface and dark cards on a light surface are both supported.
+Shoot on **green** cloth or paper that fills the white guide. If the card itself is green (pips, back, art), use **orange** instead. Line the card up inside the guide (it does not have to be perfectly square). The app keys out that colour, warps the card to 1000×1400, and uploads.
 
 If the Mac is unreachable, shots queue locally and retry.
 
